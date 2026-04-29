@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
+import { StripeWebhookController } from './stripe-webhook.controller';
 
-// Stub — full implementation coming next
-@Module({})
+@Module({
+  controllers: [StripeWebhookController],
+})
 export class StripeModule {}

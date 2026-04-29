@@ -3,21 +3,19 @@ import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { MESSAGE_PROCESSING_QUEUE, MessageJob } from '../../integrations/whatsapp/whatsapp.service';
+import { WhatsAppService } from '../../integrations/whatsapp/whatsapp.service';
+import { AiPipelineService } from '../../ai-pipeline/ai-pipeline.service';
 
-// WorkerHost: base class for BullMQ processors in NestJS.
-// @Processor decorator registers this class as the consumer for the queue.
-// process() is called for every job dequeued from Redis.
-// Think of this as a Celery task in Python: @app.task(bind=True) def process(self, job).
 @Processor(MESSAGE_PROCESSING_QUEUE, {
-  concurrency: 5, // process up to 5 messages in parallel
+  concurrency: 5,
 })
 export class MessageProcessorProcessor extends WorkerHost {
   private readonly logger = new Logger(MessageProcessorProcessor.name);
 
   constructor(
     private readonly prisma: PrismaService,
-    // AiPipelineService and WhatsAppService will be injected here once implemented.
-    // Using any for now to avoid circular dependency before those modules exist.
+    private readonly aiPipeline: AiPipelineService,
+    private readonly whatsapp: WhatsAppService,
   ) {
     super();
   }
@@ -136,13 +134,84 @@ export class MessageProcessorProcessor extends WorkerHost {
         return;
       }
 
-      // ── Step 8: AI pipeline (wired in Phase 2 of implementation) ────────
-      // TODO: inject AiPipelineService and call:
-      //   await this.aiPipeline.run({ conversation, agent, contact, parsed });
-      // For now, mark as processed
-      this.logger.log(
-        `Message ${parsed.wamid} ready for AI pipeline — pipeline not yet wired`,
+      // ── Step 8: Run AI pipeline ─────────────────────────────────────────
+      const fullConversation = await this.prisma.conversation.findUnique({
+        where: { id: conversation.id },
+        include: {
+          agent: true,
+          contact: true,
+        },
+      });
+
+      if (!fullConversation) {
+        await this.markEventSkipped(webhookEventId, 'Conversation not found after create');
+        return;
+      }
+
+      // Only process text messages through AI — other types get a generic response
+      const inboundText = parsed.text ?? `[${parsed.type} recibido]`;
+
+      const result = await this.aiPipeline.run({
+        conversation: fullConversation as any,
+        inboundText,
+        organizationId,
+      });
+
+      // Artificial delay to feel more human
+      if (agent.responseDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, agent.responseDelayMs));
+      }
+
+      // Send the AI response via WhatsApp
+      const outboundWamid = await this.whatsapp.sendReply(
+        organizationId,
+        parsed.fromPhone,
+        result.responseText,
       );
+
+      // Persist outbound message
+      await this.prisma.message.create({
+        data: {
+          organizationId,
+          conversationId: conversation.id,
+          direction: 'OUTBOUND',
+          type: 'TEXT',
+          status: 'SENT',
+          content: result.responseText,
+          whatsappMsgId: outboundWamid,
+          isAiGenerated: true,
+          modelUsed: result.modelUsed,
+          promptTokens: result.promptTokens,
+          completionTokens: result.completionTokens,
+          latencyMs: result.latencyMs,
+          toolCallName: result.toolsUsed.length > 0 ? result.toolsUsed.join(',') : null,
+        },
+      });
+
+      // Update conversation counters
+      await this.prisma.conversation.update({
+        where: { id: conversation.id },
+        data: {
+          messageCount: { increment: 1 },
+          aiHandledCount: { increment: 1 },
+          lastMessageAt: new Date(),
+          status: result.wasEscalated ? 'WAITING_HUMAN' : 'IN_PROGRESS',
+        },
+      });
+
+      // Upsert daily analytics
+      await this.upsertAnalytics(organizationId, agent.id, {
+        inbound: 1,
+        outbound: 1,
+        aiHandled: 1,
+        escalations: result.wasEscalated ? 1 : 0,
+        promptTokens: result.promptTokens,
+        completionTokens: result.completionTokens,
+        latencyMs: result.latencyMs,
+      });
+
+      // Mark incoming message as read
+      await this.whatsapp.markRead(organizationId, parsed.wamid);
 
       await this.markEventProcessed(webhookEventId);
     } catch (error) {
@@ -194,6 +263,70 @@ export class MessageProcessorProcessor extends WorkerHost {
       where: { id: webhookEventId },
       data: { status: 'SKIPPED', errorMessage: reason, processedAt: new Date() },
     });
+  }
+
+  private async upsertAnalytics(
+    organizationId: string,
+    agentId: string,
+    data: {
+      inbound: number;
+      outbound: number;
+      aiHandled: number;
+      escalations: number;
+      promptTokens: number;
+      completionTokens: number;
+      latencyMs: number;
+    },
+  ): Promise<void> {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // Cannot use prisma.upsert because agentId is nullable in @@unique — use findFirst + update/create
+    const existing = await this.prisma.dailyAnalytics.findFirst({
+      where: { organizationId, agentId, date: today },
+    });
+
+    const totalTokens = data.promptTokens + data.completionTokens;
+    // Rough cost estimate: DeepSeek V3 ~$0.27/M input, $1.10/M output
+    const estimatedCost =
+      (data.promptTokens / 1_000_000) * 0.27 +
+      (data.completionTokens / 1_000_000) * 1.1;
+
+    if (existing) {
+      await this.prisma.dailyAnalytics.update({
+        where: { id: existing.id },
+        data: {
+          inboundMessages: { increment: data.inbound },
+          outboundMessages: { increment: data.outbound },
+          totalMessages: { increment: data.inbound + data.outbound },
+          aiHandled: { increment: data.aiHandled },
+          escalations: { increment: data.escalations },
+          promptTokens: { increment: data.promptTokens },
+          completionTokens: { increment: data.completionTokens },
+          totalTokensUsed: { increment: totalTokens },
+          estimatedCostUsd: { increment: estimatedCost },
+          avgLatencyMs: data.latencyMs,
+        },
+      });
+    } else {
+      await this.prisma.dailyAnalytics.create({
+        data: {
+          organizationId,
+          agentId,
+          date: today,
+          inboundMessages: data.inbound,
+          outboundMessages: data.outbound,
+          totalMessages: data.inbound + data.outbound,
+          aiHandled: data.aiHandled,
+          escalations: data.escalations,
+          promptTokens: data.promptTokens,
+          completionTokens: data.completionTokens,
+          totalTokensUsed: totalTokens,
+          estimatedCostUsd: estimatedCost,
+          avgLatencyMs: data.latencyMs,
+        },
+      });
+    }
   }
 
   private mapMessageType(type: string): 'TEXT' | 'IMAGE' | 'AUDIO' | 'VIDEO' | 'DOCUMENT' | 'INTERACTIVE' | 'SYSTEM' {
