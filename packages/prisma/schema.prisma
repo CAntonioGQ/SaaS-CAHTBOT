@@ -37,11 +37,6 @@ enum AgentTone {
   CASUAL
 }
 
-enum ModelTier {
-  FREE
-  STARTER
-}
-
 enum ConversationStatus {
   OPEN
   IN_PROGRESS
@@ -107,6 +102,7 @@ enum WebhookSource {
 enum WebhookEventStatus {
   PENDING
   PROCESSING
+  RETRYING
   PROCESSED
   FAILED
   SKIPPED
@@ -137,8 +133,8 @@ model User {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  memberships        OrganizationMember[]
-  refreshTokens      RefreshToken[]
+  memberships         OrganizationMember[]
+  refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
 
   @@index([email])
@@ -218,8 +214,8 @@ model OrganizationMember {
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
 
-  organization          Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization          Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user                  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   assignedConversations Conversation[] @relation("AssignedMember")
   assignedLeads         Lead[]         @relation("AssignedLead")
   sentMessages          Message[]      @relation("SentByMember")
@@ -258,7 +254,12 @@ model Agent {
   avatarUrl      String?
   status         AgentStatus @default(DRAFT)
   tone           AgentTone   @default(PROFESSIONAL)
-  modelTier      ModelTier   @default(FREE)
+
+  // AI model — stored as OpenRouter model IDs, not coupled to billing tier
+  // Free plan default:    tencent/hy3-preview:free
+  // Starter plan default: deepseek/deepseek-chat-v3-0324
+  modelName         String @default("tencent/hy3-preview:free")
+  fallbackModelName String @default("deepseek/deepseek-chat-v3-0324")
 
   // Prompts
   systemPrompt        String @db.Text
@@ -312,7 +313,7 @@ model Contact {
   avatarUrl      String?
   tags           String[]  @default([])
   notes          String?   @db.Text
-  metadata       Json      @default("{}")
+  customFields   Json      @default("{}")
   blockedAt      DateTime?
   lastSeenAt     DateTime?
   createdAt      DateTime  @default(now())
@@ -337,24 +338,26 @@ model Conversation {
   contactId        String
   assignedMemberId String?
   status           ConversationStatus @default(OPEN)
+  channelType      String             @default("whatsapp") // whatsapp | instagram | sms
 
   // Context
-  subject String?
-  summary String?  @db.Text // AI memory compression output
-  tags    String[] @default([])
-  isTest  Boolean  @default(false)
+  subject  String?
+  summary  String?  @db.Text // AI memory compression output
+  tags     String[] @default([])
+  isTest   Boolean  @default(false)
 
   // Timing
-  firstMessageAt  DateTime?
-  lastMessageAt   DateTime?
-  resolvedAt      DateTime?
-  escalatedAt     DateTime?
+  firstMessageAt   DateTime?
+  lastMessageAt    DateTime?
+  resolvedAt       DateTime?
+  escalatedAt      DateTime?
   lastSummarizedAt DateTime?
 
   // Counters
   messageCount      Int @default(0)
   aiHandledCount    Int @default(0)
   humanHandledCount Int @default(0)
+  unreadCount       Int @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -393,7 +396,8 @@ model Message {
   mediaCaption String?
 
   // WhatsApp metadata
-  whatsappMsgId     String?   @unique // wamid — dedup key
+  // Composite unique (not global) — multiple NULLs allowed in Postgres for manual/non-WA messages
+  whatsappMsgId     String?
   whatsappTimestamp DateTime?
 
   // AI metadata
@@ -410,18 +414,18 @@ model Message {
   // Human agent who sent this (if not AI)
   sentByMemberId String?
 
-  // Excluded from summary compression (always keep last N raw)
+  // Excluded from summary compression (last N messages stay raw)
   excludeFromSummary Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  conversation  Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  sentByMember  OrganizationMember? @relation("SentByMember", fields: [sentByMemberId], references: [id])
+  conversation Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sentByMember OrganizationMember? @relation("SentByMember", fields: [sentByMemberId], references: [id])
 
+  @@unique([organizationId, whatsappMsgId])
   @@index([conversationId])
   @@index([organizationId])
-  @@index([whatsappMsgId])
   @@index([conversationId, createdAt])
 }
 
@@ -505,12 +509,13 @@ model WebhookEvent {
   organizationId String
   source         WebhookSource      @default(WHATSAPP)
   eventType      String
-  whatsappMsgId  String?            // fast dedup lookup
+  whatsappMsgId  String?            // fast dedup lookup before processing
   payload        Json               // raw payload — kept for replay / debugging
   status         WebhookEventStatus @default(PENDING)
   processedAt    DateTime?
   errorMessage   String?            @db.Text
   retryCount     Int                @default(0)
+  nextRetryAt    DateTime?
   createdAt      DateTime           @default(now())
 
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
@@ -518,6 +523,7 @@ model WebhookEvent {
   @@index([organizationId])
   @@index([status, createdAt])
   @@index([whatsappMsgId])
+  @@index([nextRetryAt])
 }
 
 // ─── Billing ──────────────────────────────────────────────────────────────────
@@ -539,8 +545,7 @@ model Plan {
   maxContacts              Int @default(500)
   maxTeamMembers           Int @default(1)
 
-  // Feature flags as JSON array of strings
-  // e.g. ["lead_capture", "appointments", "analytics"]
+  // Feature flags as JSON array: ["lead_capture", "appointments", "analytics"]
   features Json @default("[]")
 
   createdAt DateTime @default(now())
@@ -565,6 +570,12 @@ model Subscription {
   cancelAtPeriodEnd  Boolean            @default(false)
   cancelledAt        DateTime?
 
+  // Snapshot of pricing/limits at time of purchase
+  // Ensures old customers keep their contract if plan changes
+  priceUsdAtPurchase         Decimal @default(0) @db.Decimal(10, 2)
+  maxMessagesAtPurchase      Int     @default(0)
+  maxConversationsAtPurchase Int     @default(0)
+
   // Usage counters — reset at period start via cron
   conversationsUsed Int @default(0)
   messagesUsed      Int @default(0)
@@ -582,25 +593,36 @@ model Subscription {
 
 // ─── Analytics ────────────────────────────────────────────────────────────────
 
+// agentId = null means org-level aggregate row.
+// NOTE: @@unique on nullable agentId — Postgres treats NULLs as distinct in unique
+// constraints, so org-level rows (agentId=null) can duplicate. Guard uniqueness
+// at application level with findFirst + upsert pattern, not Prisma upsert.
 model DailyAnalytics {
   id             String   @id @default(cuid())
   organizationId String
-  agentId        String?  // null = org-level aggregate
+  agentId        String?
   date           DateTime @db.Date
 
-  totalMessages         Int     @default(0)
-  inboundMessages       Int     @default(0)
-  outboundMessages      Int     @default(0)
-  aiHandled             Int     @default(0)
-  humanHandled          Int     @default(0)
-  escalations           Int     @default(0)
-  newConversations      Int     @default(0)
-  resolvedConversations Int     @default(0)
-  newLeads              Int     @default(0)
-  newAppointments       Int     @default(0)
-  avgResponseMs         Int?
-  totalTokensUsed       Int     @default(0)
-  estimatedCostUsd      Decimal @default(0) @db.Decimal(10, 6)
+  // Volume
+  totalMessages         Int @default(0)
+  inboundMessages       Int @default(0)
+  outboundMessages      Int @default(0)
+  aiHandled             Int @default(0)
+  humanHandled          Int @default(0)
+  escalations           Int @default(0)
+  newConversations      Int @default(0)
+  resolvedConversations Int @default(0)
+  newLeads              Int @default(0)
+  newAppointments       Int @default(0)
+
+  // AI cost tracking — prompt and completion have different prices
+  promptTokens     Int     @default(0)
+  completionTokens Int     @default(0)
+  totalTokensUsed  Int     @default(0) // prompt + completion
+  estimatedCostUsd Decimal @default(0) @db.Decimal(10, 6)
+
+  // Performance
+  avgLatencyMs Int?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -616,20 +638,20 @@ model DailyAnalytics {
 model AuditLog {
   id             String      @id @default(cuid())
   organizationId String
-  memberId       String?
+  actorId        String?     // OrganizationMember who performed the action
   action         AuditAction
-  resourceType   String
-  resourceId     String?
-  metadata       Json        @default("{}")
+  entityType     String      // "Agent" | "Conversation" | "Lead" | "Subscription" | ...
+  entityId       String?
+  metadata       Json        @default("{}") // small context only — no full payloads
   ipAddress      String?
   userAgent      String?
   createdAt      DateTime    @default(now())
 
   organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  member       OrganizationMember? @relation(fields: [memberId], references: [id])
+  actor        OrganizationMember? @relation(fields: [actorId], references: [id])
 
   @@index([organizationId])
   @@index([organizationId, action])
   @@index([organizationId, createdAt])
-  @@index([memberId])
+  @@index([actorId])
 }
