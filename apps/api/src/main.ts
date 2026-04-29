@@ -9,6 +9,10 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn', 'log', 'debug'],
+    // rawBody: true exposes req.rawBody on every request.
+    // Required for HMAC signature verification on WhatsApp and Stripe webhooks.
+    // Without it, Express already parsed the JSON and the original bytes are gone.
+    rawBody: true,
   });
 
   // Security headers (X-Frame-Options, CSP, HSTS, etc.)

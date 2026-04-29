@@ -5,10 +5,12 @@ import { BullModule } from '@nestjs/bullmq';
 import { PrismaModule } from './prisma/prisma.module';
 import { CommonModule } from './common/common.module';
 import { validateEnv } from './config/env.validation';
+import { HealthModule } from './modules/health/health.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
 import { AgentsModule } from './modules/agents/agents.module';
-import { WhatsappModule } from './modules/whatsapp/whatsapp.module';
+import { WhatsappModule } from './modules/integrations/whatsapp/whatsapp.module';
+import { StripeModule } from './modules/integrations/stripe/stripe.module';
 import { ConversationsModule } from './modules/conversations/conversations.module';
 import { MessagesModule } from './modules/messages/messages.module';
 import { LeadsModule } from './modules/leads/leads.module';
@@ -52,11 +54,13 @@ import { AiPipelineModule } from './modules/ai-pipeline/ai-pipeline.module';
     PrismaModule,
     CommonModule,
 
+    // Observability — must be first so Railway can probe before features load
+    HealthModule,
+
     // Feature modules — each handles its own routes, services, guards
     AuthModule,
     OrganizationsModule,
     AgentsModule,
-    WhatsappModule,
     ConversationsModule,
     MessagesModule,
     LeadsModule,
@@ -66,6 +70,10 @@ import { AiPipelineModule } from './modules/ai-pipeline/ai-pipeline.module';
     BillingModule,
     QueueModule,
     AiPipelineModule,
+
+    // External integrations
+    WhatsappModule,
+    StripeModule,
   ],
 })
 export class AppModule {}
