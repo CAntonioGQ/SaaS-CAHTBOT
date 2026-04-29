@@ -1,0 +1,635 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum OrganizationStatus {
+  TRIAL
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MEMBER
+  AGENT
+}
+
+enum AgentStatus {
+  DRAFT
+  ACTIVE
+  INACTIVE
+}
+
+enum AgentTone {
+  FORMAL
+  FRIENDLY
+  PROFESSIONAL
+  CASUAL
+}
+
+enum ModelTier {
+  FREE
+  STARTER
+}
+
+enum ConversationStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_HUMAN
+  HUMAN_ACTIVE
+  RESOLVED
+  CLOSED
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  AUDIO
+  VIDEO
+  DOCUMENT
+  TEMPLATE
+  INTERACTIVE
+  SYSTEM
+}
+
+enum MessageStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  CONVERTED
+  LOST
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  INCOMPLETE
+}
+
+enum WebhookSource {
+  WHATSAPP
+  STRIPE
+}
+
+enum WebhookEventStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+  SKIPPED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  ESCALATE
+  EXPORT
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String
+  firstName       String?
+  lastName        String?
+  avatarUrl       String?
+  emailVerified   Boolean   @default(false)
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  memberships        OrganizationMember[]
+  refreshTokens      RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([email])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  token     String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime  @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  token     String    @unique @default(cuid())
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+}
+
+// ─── Organization (Tenant) ────────────────────────────────────────────────────
+
+model Organization {
+  id       String             @id @default(cuid())
+  name     String
+  slug     String             @unique
+  logoUrl  String?
+  status   OrganizationStatus @default(TRIAL)
+  timezone String             @default("America/Mexico_City")
+
+  // WhatsApp Cloud API — stored AES-256-GCM encrypted
+  whatsappPhoneNumberId      String?
+  whatsappAccessToken        String?
+  whatsappAppSecret          String?
+  whatsappWebhookVerifyToken String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members       OrganizationMember[]
+  invites       OrganizationInvite[]
+  agents        Agent[]
+  contacts      Contact[]
+  conversations Conversation[]
+  leads         Lead[]
+  appointments  Appointment[]
+  webhookEvents WebhookEvent[]
+  subscription  Subscription?
+  analytics     DailyAnalytics[]
+  auditLogs     AuditLog[]
+
+  @@index([slug])
+  @@index([whatsappPhoneNumberId])
+}
+
+model OrganizationMember {
+  id             String     @id @default(cuid())
+  organizationId String
+  userId         String
+  role           MemberRole @default(MEMBER)
+  isActive       Boolean    @default(true)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  organization          Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedConversations Conversation[] @relation("AssignedMember")
+  assignedLeads         Lead[]         @relation("AssignedLead")
+  sentMessages          Message[]      @relation("SentByMember")
+  auditLogs             AuditLog[]
+
+  @@unique([organizationId, userId])
+  @@index([organizationId])
+  @@index([userId])
+}
+
+model OrganizationInvite {
+  id              String     @id @default(cuid())
+  organizationId  String
+  email           String
+  role            MemberRole @default(MEMBER)
+  token           String     @unique @default(cuid())
+  expiresAt       DateTime
+  usedAt          DateTime?
+  createdByUserId String?
+  createdAt       DateTime   @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, email])
+  @@index([token])
+  @@index([organizationId])
+}
+
+// ─── Agent ────────────────────────────────────────────────────────────────────
+
+model Agent {
+  id             String      @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  avatarUrl      String?
+  status         AgentStatus @default(DRAFT)
+  tone           AgentTone   @default(PROFESSIONAL)
+  modelTier      ModelTier   @default(FREE)
+
+  // Prompts
+  systemPrompt        String @db.Text
+  welcomeMessage      String @default("Hola, ¿en qué te puedo ayudar?")
+  fallbackMessage     String @default("Lo siento, no entendí tu mensaje. ¿Puedes intentarlo de nuevo?")
+  outsideHoursMessage String @default("Gracias por escribirnos. Te responderemos en horario de atención.")
+
+  // AI config
+  temperature     Float @default(0.3)
+  maxTokens       Int   @default(500)
+  contextMessages Int   @default(12)
+
+  // Feature flags
+  leadCaptureEnabled     Boolean @default(true)
+  appointmentEnabled     Boolean @default(false)
+  inventoryEnabled       Boolean @default(false)
+  humanEscalationEnabled Boolean @default(true)
+
+  // Business hours — { mon: { enabled: true, open: "09:00", close: "18:00" }, ... }
+  businessHours Json @default("{}")
+
+  // Escalation
+  escalationKeywords String[] @default([])
+  escalationEmail    String?
+
+  // Inventory integration (Phase 2)
+  inventoryWebhookUrl    String?
+  inventoryWebhookSecret String?
+
+  // UX — artificial typing delay in ms
+  responseDelayMs Int @default(1500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+}
+
+// ─── Contact ──────────────────────────────────────────────────────────────────
+
+model Contact {
+  id             String    @id @default(cuid())
+  organizationId String
+  whatsappPhone  String
+  name           String?
+  email          String?
+  avatarUrl      String?
+  tags           String[]  @default([])
+  notes          String?   @db.Text
+  metadata       Json      @default("{}")
+  blockedAt      DateTime?
+  lastSeenAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  leads         Lead[]
+  appointments  Appointment[]
+
+  @@unique([organizationId, whatsappPhone])
+  @@index([organizationId])
+  @@index([organizationId, whatsappPhone])
+}
+
+// ─── Conversation ─────────────────────────────────────────────────────────────
+
+model Conversation {
+  id               String             @id @default(cuid())
+  organizationId   String
+  agentId          String
+  contactId        String
+  assignedMemberId String?
+  status           ConversationStatus @default(OPEN)
+
+  // Context
+  subject String?
+  summary String?  @db.Text // AI memory compression output
+  tags    String[] @default([])
+  isTest  Boolean  @default(false)
+
+  // Timing
+  firstMessageAt  DateTime?
+  lastMessageAt   DateTime?
+  resolvedAt      DateTime?
+  escalatedAt     DateTime?
+  lastSummarizedAt DateTime?
+
+  // Counters
+  messageCount      Int @default(0)
+  aiHandledCount    Int @default(0)
+  humanHandledCount Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  agent          Agent               @relation(fields: [agentId], references: [id])
+  contact        Contact             @relation(fields: [contactId], references: [id])
+  assignedMember OrganizationMember? @relation("AssignedMember", fields: [assignedMemberId], references: [id])
+  messages       Message[]
+  leads          Lead[]
+  appointments   Appointment[]
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, agentId])
+  @@index([organizationId, contactId])
+  @@index([assignedMemberId])
+  @@index([lastMessageAt])
+  @@index([organizationId, isTest])
+}
+
+// ─── Message ──────────────────────────────────────────────────────────────────
+
+model Message {
+  id             String           @id @default(cuid())
+  organizationId String
+  conversationId String
+  direction      MessageDirection
+  type           MessageType      @default(TEXT)
+  status         MessageStatus    @default(QUEUED)
+
+  // Content
+  content      String  @db.Text
+  mediaUrl     String?
+  mediaType    String?
+  mediaCaption String?
+
+  // WhatsApp metadata
+  whatsappMsgId     String?   @unique // wamid — dedup key
+  whatsappTimestamp DateTime?
+
+  // AI metadata
+  isAiGenerated    Boolean @default(false)
+  modelUsed        String?
+  promptTokens     Int?
+  completionTokens Int?
+  latencyMs        Int?
+
+  // Tool call that triggered this response
+  toolCallId   String?
+  toolCallName String?
+
+  // Human agent who sent this (if not AI)
+  sentByMemberId String?
+
+  // Excluded from summary compression (always keep last N raw)
+  excludeFromSummary Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  conversation  Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sentByMember  OrganizationMember? @relation("SentByMember", fields: [sentByMemberId], references: [id])
+
+  @@index([conversationId])
+  @@index([organizationId])
+  @@index([whatsappMsgId])
+  @@index([conversationId, createdAt])
+}
+
+// ─── Lead ─────────────────────────────────────────────────────────────────────
+
+model Lead {
+  id             String     @id @default(cuid())
+  organizationId String
+  conversationId String?
+  contactId      String
+
+  name     String
+  email    String?
+  phone    String?
+  company  String?
+  interest String?  @db.Text
+  budget   String?
+  source   String   @default("whatsapp")
+
+  status   LeadStatus @default(NEW)
+  score    Int        @default(0)
+  notes    String?    @db.Text
+  metadata Json       @default("{}")
+
+  assignedToId String?
+  convertedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversation Conversation?       @relation(fields: [conversationId], references: [id])
+  contact      Contact             @relation(fields: [contactId], references: [id])
+  assignedTo   OrganizationMember? @relation("AssignedLead", fields: [assignedToId], references: [id])
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt])
+  @@index([contactId])
+}
+
+// ─── Appointment ──────────────────────────────────────────────────────────────
+
+model Appointment {
+  id             String            @id @default(cuid())
+  organizationId String
+  conversationId String?
+  contactId      String
+  agentId        String?
+
+  title           String
+  description     String?           @db.Text
+  scheduledAt     DateTime
+  durationMinutes Int               @default(60)
+  location        String?
+  status          AppointmentStatus @default(PENDING)
+  notes           String?           @db.Text
+  metadata        Json              @default("{}")
+
+  confirmedAt        DateTime?
+  reminderSentAt     DateTime?
+  cancelledAt        DateTime?
+  cancellationReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+  contact      Contact       @relation(fields: [contactId], references: [id])
+
+  @@index([organizationId])
+  @@index([organizationId, scheduledAt])
+  @@index([organizationId, status])
+  @@index([contactId])
+}
+
+// ─── WhatsApp Webhook Events ──────────────────────────────────────────────────
+
+model WebhookEvent {
+  id             String             @id @default(cuid())
+  organizationId String
+  source         WebhookSource      @default(WHATSAPP)
+  eventType      String
+  whatsappMsgId  String?            // fast dedup lookup
+  payload        Json               // raw payload — kept for replay / debugging
+  status         WebhookEventStatus @default(PENDING)
+  processedAt    DateTime?
+  errorMessage   String?            @db.Text
+  retryCount     Int                @default(0)
+  createdAt      DateTime           @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([status, createdAt])
+  @@index([whatsappMsgId])
+}
+
+// ─── Billing ──────────────────────────────────────────────────────────────────
+
+model Plan {
+  id              String  @id @default(cuid())
+  name            String  @unique // "Free" | "Starter"
+  stripePriceId   String? @unique // null for free plan
+  stripeProductId String?
+  description     String?
+  priceMonthly    Decimal @default(0) @db.Decimal(10, 2)
+  currency        String  @default("USD")
+  isActive        Boolean @default(true)
+
+  // Limits
+  maxAgents                Int @default(1)
+  maxConversationsPerMonth Int @default(100)
+  maxMessagesPerMonth      Int @default(1000)
+  maxContacts              Int @default(500)
+  maxTeamMembers           Int @default(1)
+
+  // Feature flags as JSON array of strings
+  // e.g. ["lead_capture", "appointments", "analytics"]
+  features Json @default("[]")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id             String @id @default(cuid())
+  organizationId String @unique
+  planId         String
+
+  // Stripe — null for free plan
+  stripeCustomerId     String? @unique
+  stripeSubscriptionId String? @unique
+
+  status             SubscriptionStatus @default(TRIALING)
+  currentPeriodStart DateTime           @default(now())
+  currentPeriodEnd   DateTime
+  trialEndsAt        DateTime?
+  cancelAtPeriodEnd  Boolean            @default(false)
+  cancelledAt        DateTime?
+
+  // Usage counters — reset at period start via cron
+  conversationsUsed Int @default(0)
+  messagesUsed      Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  plan         Plan         @relation(fields: [planId], references: [id])
+
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+  @@index([status])
+}
+
+// ─── Analytics ────────────────────────────────────────────────────────────────
+
+model DailyAnalytics {
+  id             String   @id @default(cuid())
+  organizationId String
+  agentId        String?  // null = org-level aggregate
+  date           DateTime @db.Date
+
+  totalMessages         Int     @default(0)
+  inboundMessages       Int     @default(0)
+  outboundMessages      Int     @default(0)
+  aiHandled             Int     @default(0)
+  humanHandled          Int     @default(0)
+  escalations           Int     @default(0)
+  newConversations      Int     @default(0)
+  resolvedConversations Int     @default(0)
+  newLeads              Int     @default(0)
+  newAppointments       Int     @default(0)
+  avgResponseMs         Int?
+  totalTokensUsed       Int     @default(0)
+  estimatedCostUsd      Decimal @default(0) @db.Decimal(10, 6)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, agentId, date])
+  @@index([organizationId, date])
+}
+
+// ─── Audit Log ────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id             String      @id @default(cuid())
+  organizationId String
+  memberId       String?
+  action         AuditAction
+  resourceType   String
+  resourceId     String?
+  metadata       Json        @default("{}")
+  ipAddress      String?
+  userAgent      String?
+  createdAt      DateTime    @default(now())
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  member       OrganizationMember? @relation(fields: [memberId], references: [id])
+
+  @@index([organizationId])
+  @@index([organizationId, action])
+  @@index([organizationId, createdAt])
+  @@index([memberId])
+}
